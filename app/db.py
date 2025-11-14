@@ -29,6 +29,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         patient_id INTEGER,
         timestamp TEXT,
+        modality TEXT,               -- ← ЭТОГО НЕ ХВАТАЕТ!
         label TEXT,
         diagnosis TEXT,
         probability REAL,
@@ -37,6 +38,7 @@ def init_db():
         heatmap_path TEXT,
         FOREIGN KEY(patient_id) REFERENCES patients(id)
     )""")
+
     conn.commit()
     conn.close()
 
@@ -74,10 +76,22 @@ def insert_or_update_patient(name: str, payload: Dict[str, Any], image_path: str
         pid = cur.lastrowid
 
     # append to history
-    cur.execute("""INSERT INTO history (patient_id, timestamp, label, diagnosis, probability, risk, image_path, heatmap_path)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (pid, now, payload.get("label"), payload.get("diagnosis"), float(payload.get("probability",0.0)),
-                 risk, image_path, heatmap_path))
+    cur.execute("""
+    INSERT INTO history 
+    (patient_id, timestamp, modality, label, diagnosis, probability, risk, image_path, heatmap_path)
+    VALUES (?,?,?,?,?,?,?,?,?)""",
+    (
+        pid,
+        now,
+        payload.get("modality"),     # 🟢 добавили!
+        payload.get("label"),
+        payload.get("diagnosis"),
+        float(payload.get("probability", 0.0)),
+        risk,
+        image_path,
+        heatmap_path
+    ))
+
     conn.commit()
     conn.close()
     return pid
@@ -132,12 +146,90 @@ def get_history(pid: int) -> list:
     conn.close()
     return rows
 
-def clear_database():
-    """Полностью очищает базу пациентов и историю наблюдений."""
+# --------------------------------------------
+# Health Index (0–100) — общая шкала состояния пациента
+# --------------------------------------------
+
+def health_index(label: str, risk: str) -> int:
+    """
+    Преобразует диагноз и уровень риска в шкалу состояния 0–100.
+    100 = полностью здоров
+    0   = крайне тяжёлое состояние
+    """
+
+    label = (label or "").lower()
+    risk = (risk or "low").lower()
+
+    # базовые уровни по риску
+    base = {
+        "low": 85,
+        "medium": 55,
+        "high": 25
+    }.get(risk, 70)
+
+    # коррекция по диагнозу
+    bad_keywords = [
+        "critical", "infarkt", "stroke", "severe", "tumor",
+        "glioma", "meningioma", "pituitary", "pneumonia"
+    ]
+    warn_keywords = [
+        "arrhythmia", "block", "ischemia", "lesion", "nodule"
+    ]
+
+    # ухудшение при тяжелых диагнозах
+    if any(w in label for w in bad_keywords):
+        base -= 25
+    elif any(w in label for w in warn_keywords):
+        base -= 10
+
+    # ограничение в пределах 0—100
+    base = max(0, min(100, base))
+    return int(base)
+
+# ------------------------------------------------------
+# 🔧 Автоматическая миграция структуры базы данных
+# ------------------------------------------------------
+
+def column_exists(cursor, table: str, column: str) -> bool:
+    cursor.execute(f"PRAGMA table_info({table})")
+    cols = [row[1] for row in cursor.fetchall()]
+    return column in cols
+
+
+def migrate_db():
+    """
+    Автоматически обновляет структуру БД:
+    - добавляет недостающие колонки
+    - обеспечивает совместимость старых таблиц
+    """
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM history;")
-    cur.execute("DELETE FROM patients;")
+
+    # ---------- Проверяем таблицу history ----------
+    cur.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT)")
+    cur.execute("PRAGMA table_info(history)")
+    existing_cols = [row[1] for row in cur.fetchall()]
+
+    required = [
+        ("patient_id", "INTEGER"),
+        ("timestamp", "TEXT"),
+        ("modality", "TEXT"),
+        ("label", "TEXT"),
+        ("diagnosis", "TEXT"),
+        ("probability", "REAL"),
+        ("risk", "TEXT"),
+        ("image_path", "TEXT"),
+        ("heatmap_path", "TEXT"),
+    ]
+
+    for col, col_type in required:
+        if col not in existing_cols:
+            print(f"[MIGRATION] Добавляю колонку history.{col}")
+            cur.execute(f"ALTER TABLE history ADD COLUMN {col} {col_type}")
+
+    # Заполняем modality, если пусто
+    cur.execute("UPDATE history SET modality='Unknown' WHERE modality IS NULL OR modality=''")
+
     conn.commit()
     conn.close()
-    print("✅ База данных очищена.")
+    print("✅ Миграция выполнена")
