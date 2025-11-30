@@ -123,9 +123,9 @@ def predict_ecg(pil_img: Image.Image, save_heatmap_path: Optional[str]) -> Dict[
 
     label = classes[cls_idx]
     diagnosis = {
-        "Normal":     "✅ Ритм сердца в пределах нормы.",
-        "Arrhythmia": "⚠️ Признаки аритмии. Рекомендуется консультация кардиолога.",
-        "Critical":   "🚨 Критические изменения миокарда. Требуется срочная помощь."
+        "Normal":     "Ритм сердца в пределах нормы.",
+        "Arrhythmia": "Признаки аритмии. Рекомендуется консультация кардиолога.",
+        "Critical":   "Критические изменения миокарда. Требуется срочная помощь."
     }[label]
 
     return {"modality":"ECG","label":label,"probability":round(prob,2),"diagnosis":diagnosis,"heatmap_path":heatmap_path}
@@ -139,10 +139,18 @@ def predict_mri(pil_img: Image.Image, save_heatmap_path: Optional[str]) -> Dict[
     out = model(x)
     probs = torch.softmax(out, dim=1)[0]
     cls_idx = int(torch.argmax(probs).item())
-    prob = float(probs[cls_idx].detach().cpu().item() * 100)
+    prob = float(probs[cls_idx].item() * 100)
 
     classes = list(_mri_classes)
-    label = classes[cls_idx] if 0 <= cls_idx < len(classes) else "unknown"
+    label = classes[cls_idx]
+
+    # === логика риска ===
+    if label == "glioma" or label == "pituitary":
+        risk_level = "high"
+    elif label == "meningioma":
+        risk_level = "medium"
+    else:
+        risk_level = "low"
 
     heatmap_path = None
     if save_heatmap_path:
@@ -153,14 +161,21 @@ def predict_mri(pil_img: Image.Image, save_heatmap_path: Optional[str]) -> Dict[
         heatmap_path = save_heatmap_path
 
     diagnosis_map = {
-        "glioma":     "🧬 Глиома — вероятно злокачественное образование.",
-        "meningioma": "🧫 Менингиома — чаще доброкачественная, требуется наблюдение.",
-        "pituitary":  "🧠 Опухоль гипофиза — возможны эндокринные нарушения.",
-        "notumor":    "✅ Признаков опухоли не выявлено."
+        "glioma":     "Глиома — вероятно злокачественное образование.",
+        "meningioma": "Менингиома — чаще доброкачественная, требуется наблюдение.",
+        "pituitary":  "Опухоль гипофиза — возможны эндокринные нарушения.",
+        "notumor":    "Признаков опухоли не выявлено."
     }
-    diagnosis = diagnosis_map.get(label, "Описание недоступно.")
 
-    return {"modality":"MRI","label":label,"probability":round(prob,2),"diagnosis":diagnosis,"heatmap_path":heatmap_path}
+    return {
+        "modality": "MRI",
+        "label": label,
+        "probability": round(prob, 2),
+        "diagnosis": diagnosis_map.get(label, "Описание недоступно"),
+        "risk_level": risk_level,
+        "heatmap_path": heatmap_path
+    }
+
 
 # ---------- ФЛГ (X-ray) с Grad-CAM ----------
 def predict_xray(pil_img: Image.Image, save_heatmap_path: Optional[str]) -> Dict[str, Any]:
@@ -178,15 +193,15 @@ def predict_xray(pil_img: Image.Image, save_heatmap_path: Optional[str]) -> Dict
 
     # Уровень риска
     if p >= 0.85:
-        label = "🚨 Критично"
+        label = "🔴 Критично"
         diagnosis = "Высокая вероятность патологии. Требуется немедленная консультация."
         risk_level = "high"
     elif p >= 0.5:
-        label = "⚠️ Подозрительно"
+        label = "🟡 Подозрительно"
         diagnosis = "Обнаружены изменения. Рекомендуется дополнительная проверка."
         risk_level = "medium"
     else:
-        label = "✅ Вероятно норма"
+        label = "🟢 Вероятно норма"
         diagnosis = "Признаков патологии не выявлено."
         risk_level = "low"
 
@@ -208,18 +223,46 @@ def predict_xray(pil_img: Image.Image, save_heatmap_path: Optional[str]) -> Dict
     }
 
 # ---------- универсальный маршрутизатор ----------
-def predict_image(pil_img: Image.Image, workdir: str = "."):
-    modality = detect_type(pil_img)
+# ---------- универсальный маршрутизатор ----------
+def predict_image(
+    pil_img: Image.Image,
+    workdir: str = ".",
+    forced_modality: str | None = None
+):
+    """
+    forced_modality:
+        None   -> автоопределение
+        "ecg"  -> принудительно ЭКГ
+        "mri"  -> принудительно МРТ
+        "xray" -> принудительно ФЛГ
+    """
 
+    # ===== 1. определяем модальность =====
+    if forced_modality:
+        modality = forced_modality.lower()
+    else:
+        modality = detect_type(pil_img)
+
+    # ===== 2. запускаем НУЖНУЮ модель =====
     if modality == "ecg":
         result = predict_ecg(pil_img, os.path.join(workdir, "ecg_gradcam.png"))
+        result["modality"] = "ECG"
         summary = f"ЭКГ → {result['label']} ({result['probability']}%) — {result['diagnosis']}"
+
     elif modality == "mri":
         result = predict_mri(pil_img, os.path.join(workdir, "mri_gradcam.png"))
-        pretty = {"glioma":"Глиома","meningioma":"Менингиома","pituitary":"Опухоль гипофиза","notumor":"Без признаков опухоли"}.get(result["label"], result["label"])
+        result["modality"] = "MRI"
+        pretty = {
+            "glioma": "Глиома",
+            "meningioma": "Менингиома",
+            "pituitary": "Опухоль гипофиза",
+            "notumor": "Без признаков опухоли"
+        }.get(result["label"], result["label"])
         summary = f"МРТ → {pretty} ({result['probability']}%) — {result['diagnosis']}"
+
     else:
         result = predict_xray(pil_img, os.path.join(workdir, "xray_gradcam.png"))
+        result["modality"] = "X-ray"
         summary = f"Флюорография → {result['label']} ({result['probability']}%) — {result['diagnosis']}"
 
     return summary, result.get("heatmap_path"), result
